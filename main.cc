@@ -1,5 +1,6 @@
 #include <array>
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +12,8 @@
 #include <linux/rtnetlink.h>
 #include <sys/socket.h>
 
+#include <curl/curl.h>
+
 void socket_closer(FILE * f)
 {
     if ( f != nullptr )
@@ -19,35 +22,32 @@ void socket_closer(FILE * f)
     }
 }
 
-int main(int, char * [])
+void curl_closer(CURL * c)
 {
-    std::shared_ptr<FILE> s(fdopen(socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE), "r"), socket_closer);
-    if ( s == nullptr )
+    if ( c != nullptr )
     {
-        perror("Failed to open NETLINK_ROUTE socket");
-        return EXIT_FAILURE;
+        curl_easy_cleanup(c);
     }
+}
 
-    sockaddr_nl sa;
+volatile sig_atomic_t abort_flag = 0;
 
-    memset(&sa, 0x00, sizeof sa);
-    sa.nl_family = AF_NETLINK;
-    sa.nl_groups = RTMGRP_IPV4_IFADDR;
+void abort(int signal)
+{
+    abort_flag = 1;
+}
 
-    if ( bind(fileno(s.get()), reinterpret_cast<sockaddr *>(&sa), sizeof sa) == -1 )
-    {
-        perror("Failed to bind to RTMGRP_IPV4_IFADDR group");
-        return EXIT_FAILURE;
-    }
+int get_message(int s)
+{
+    std::array<char, 1u << 12u> buffer;
+    iovec iov{buffer.data(), buffer.size() * sizeof(char)};
 
     msghdr msg;
     memset(&msg, 0x00, sizeof msg);
-    std::array<char, 1u << 12u> buffer;
-    iovec iov{buffer.data(), buffer.size() * sizeof(char)};
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
 
-    auto ret = recvmsg(fileno(s.get()), &msg, 0);
+    auto ret = recvmsg(s, &msg, 0);
     if ( ret == -1 )
     {
         perror("Failed to receive message from socket");
@@ -87,6 +87,58 @@ int main(int, char * [])
             break;
         }
     }
+    return EXIT_SUCCESS;
+}
+
+int main(int, char * [])
+{
+    // signals
+    struct sigaction sact;
+    memset(&sact, 0x00, sizeof sact);
+    sact.sa_handler = abort;
+
+    int ret = 0;
+    ret += sigaction(SIGINT, &sact, nullptr);
+    ret += sigaction(SIGTERM, &sact, nullptr);
+
+    if ( ret != 0 )
+    {
+        perror("Failed to set signal handler");
+    }
+
+    // curl
+    std::shared_ptr<CURL> curl(curl_easy_init(), curl_closer);
+    curl_easy_setopt(curl.get(), CURLOPT_URL, "http://hldns.ru/update/HXQ2XC6APHW9I8RJMRH9S9A06KB4WE");
+    curl_easy_setopt(curl.get(), CURLOPT_VERBOSE, 1l);
+
+    // netlink socket
+    std::shared_ptr<FILE> s(fdopen(socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE), "r"), socket_closer);
+    if ( s == nullptr )
+    {
+        perror("Failed to open NETLINK_ROUTE socket");
+        return EXIT_FAILURE;
+    }
+
+    sockaddr_nl sa;
+    memset(&sa, 0x00, sizeof sa);
+    sa.nl_family = AF_NETLINK;
+    sa.nl_groups = RTMGRP_IPV4_IFADDR;
+
+    if ( bind(fileno(s.get()), reinterpret_cast<sockaddr *>(&sa), sizeof sa) == -1 )
+    {
+        perror("Failed to bind to RTMGRP_IPV4_IFADDR group");
+        return EXIT_FAILURE;
+    }
+
+    while ( abort_flag == 0 )
+    {
+        if ( get_message(fileno(s.get())) == EXIT_SUCCESS )
+        {
+            curl_easy_perform(curl.get());
+        }
+    }
+
+    puts("Exiting");
 
     return EXIT_SUCCESS;
 }
